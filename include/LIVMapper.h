@@ -17,8 +17,13 @@ which is included as part of this source code package.
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <image_transport/image_transport.h>
+#include <memory>
+#include <mutex>
 #include <nav_msgs/Path.h>
+#include <tf/transform_datatypes.h>
+#include <tf/transform_listener.h>
 #include <vikit/camera_loader.h>
 
 class LIVMapper
@@ -151,8 +156,19 @@ public:
 
   nav_msgs::Path path;
   nav_msgs::Odometry odomAftMapped;
+  nav_msgs::Odometry odomWorld;
   geometry_msgs::Quaternion geoQuat;
   geometry_msgs::PoseStamped msg_body_pose;
+  geometry_msgs::PoseStamped msg_body_pose_world;
+
+  bool use_external_world_frame_ = false;
+  bool world_frame_initialized_ = false;
+  bool world_frame_warning_printed_ = false;
+  std::string world_frame_id_ = "world_ENU";
+  std::string external_child_frame_;
+  tf::Transform world_to_camera_init_tf_;
+  std::mutex world_frame_mutex_;
+  std::unique_ptr<tf::TransformListener> tf_listener_;
 
   PreprocessPtr p_pre;
   ImuProcessPtr p_imu;
@@ -170,6 +186,7 @@ public:
   ros::Publisher pubLaserCloudEffect;
   ros::Publisher pubLaserCloudMap;
   ros::Publisher pubOdomAftMapped;
+  ros::Publisher pubOdomWorld;
   ros::Publisher pubPath;
   ros::Publisher pubLaserCloudDyn;
   ros::Publisher pubLaserCloudDynRmed;

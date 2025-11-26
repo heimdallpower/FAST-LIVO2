@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+#include <iomanip>
+
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
       extR(M3D::Identity())
@@ -38,6 +40,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   pcl_wait_save_intensity.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
   vio_manager.reset(new VIOManager());
+  world_to_camera_init_tf_.setIdentity();
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
@@ -108,6 +111,10 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
   nh.param<bool>("publish/pub_effect_point_en", pub_effect_point_en, false);
   nh.param<bool>("publish/dense_map_en", dense_map_en, false);
+
+  nh.param<bool>("frames/world_frame_enable", use_external_world_frame_, false);
+  nh.param<string>("frames/world_frame_id", world_frame_id_, string("world_ENU"));
+  nh.param<string>("frames/external_child_frame", external_child_frame_, string("body_FLU"));
 
   p_pre->blind_sqr = p_pre->blind * p_pre->blind;
 }
@@ -192,12 +199,29 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
   sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
 
+  if (use_external_world_frame_)
+  {
+    if (external_child_frame_.empty())
+    {
+      ROS_WARN("World frame visualization requested but no external child frame provided; disabling feature.");
+      use_external_world_frame_ = false;
+    }
+    else
+    {
+      tf_listener_.reset(new tf::TransformListener);
+    }
+  }
+
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
   pubSubVisualMap = nh.advertise<sensor_msgs::PointCloud2>("/cloud_visual_sub_map_before", 100);
   pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100);
   pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100);
   pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 10);
+  if (use_external_world_frame_)
+  {
+    pubOdomWorld = nh.advertise<nav_msgs::Odometry>("/aft_mapped_in_world", 10);
+  }
   pubPath = nh.advertise<nav_msgs::Path>("/path", 10);
   plane_pub = nh.advertise<visualization_msgs::Marker>("/planner_normal", 1);
   voxel_pub = nh.advertise<visualization_msgs::MarkerArray>("/voxels", 1);
@@ -1286,6 +1310,113 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
   q.setZ(geoQuat.z);
   transform.setRotation(q);
   br.sendTransform( tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped") );
+
+  if (use_external_world_frame_)
+  {
+    tf::Transform world_to_camera;
+    bool broadcast_world_tf = false;
+    bool log_waiting = false;
+    bool log_success = false;
+    std::string tf_error_msg;
+
+    {
+      std::lock_guard<std::mutex> lock(world_frame_mutex_);
+      if (world_frame_initialized_)
+      {
+        world_to_camera = world_to_camera_init_tf_;
+        broadcast_world_tf = true;
+      }
+    }
+
+    if (!broadcast_world_tf && tf_listener_)
+    {
+      tf::StampedTransform stamped_transform;
+      try
+      {
+        tf_listener_->lookupTransform(world_frame_id_, external_child_frame_, ros::Time(0), stamped_transform);
+
+        {
+          std::lock_guard<std::mutex> lock(world_frame_mutex_);
+          if (!world_frame_initialized_)
+          {
+            world_to_camera_init_tf_ = stamped_transform;
+            world_frame_initialized_ = true;
+            world_frame_warning_printed_ = false;
+            log_success = true;
+          }
+          world_to_camera = world_to_camera_init_tf_;
+          broadcast_world_tf = true;
+        }
+      }
+      catch (const tf::TransformException &ex)
+      {
+        std::lock_guard<std::mutex> lock(world_frame_mutex_);
+        if (!world_frame_warning_printed_)
+        {
+          world_frame_warning_printed_ = false;
+          log_waiting = true;
+          tf_error_msg = ex.what();
+        }
+      }
+    }
+
+    if (log_waiting)
+    {
+      if (!tf_error_msg.empty())
+      {
+        ROS_WARN_STREAM("Waiting for TF transform " << world_frame_id_ << " -> " << external_child_frame_
+                        << " to initialize camera_init alignment. Last error: " << tf_error_msg);
+      }
+      else
+      {
+        ROS_WARN_STREAM("Waiting for TF transform " << world_frame_id_ << " -> " << external_child_frame_
+                        << " to initialize camera_init alignment.");
+      }
+    }
+
+    if (log_success)
+    {
+      ROS_INFO_STREAM("Initialized camera_init pose in " << world_frame_id_ << " using TF transform "
+                      << world_frame_id_ << " -> " << external_child_frame_ << ".");
+    }
+
+    if (broadcast_world_tf)
+    {
+      br.sendTransform(tf::StampedTransform(world_to_camera, odomAftMapped.header.stamp, world_frame_id_, "camera_init"));
+
+      if (pubOdomWorld)
+      {
+        tf::Transform world_to_aft = world_to_camera * transform;
+        const tf::Vector3 &world_pos = world_to_aft.getOrigin();
+        const tf::Quaternion world_quat = world_to_aft.getRotation();
+
+        odomWorld = odomAftMapped;
+        odomWorld.header.frame_id = world_frame_id_;
+        odomWorld.header.stamp = odomAftMapped.header.stamp;
+        odomWorld.child_frame_id = "aft_mapped";
+        odomWorld.pose.pose.position.x = world_pos.x();
+        odomWorld.pose.pose.position.y = world_pos.y();
+        odomWorld.pose.pose.position.z = world_pos.z();
+        odomWorld.pose.pose.orientation.x = world_quat.x();
+        odomWorld.pose.pose.orientation.y = world_quat.y();
+        odomWorld.pose.pose.orientation.z = world_quat.z();
+        odomWorld.pose.pose.orientation.w = world_quat.w();
+
+        // Keep linear velocity aligned with world frame if provided.
+        odomWorld.twist = odomAftMapped.twist;
+
+        msg_body_pose_world.pose.position = odomWorld.pose.pose.position;
+        msg_body_pose_world.pose.orientation = odomWorld.pose.pose.orientation;
+        msg_body_pose_world.header.stamp = odomWorld.header.stamp;
+        msg_body_pose_world.header.frame_id = world_frame_id_;
+
+        pubOdomWorld.publish(odomWorld);
+      }
+    }
+    {
+      br.sendTransform(tf::StampedTransform(world_to_camera, odomAftMapped.header.stamp, world_frame_id_, "camera_init"));
+    }
+  }
   pubOdomAftMapped.publish(odomAftMapped);
 }
 
